@@ -20,6 +20,13 @@ from dataclasses import dataclass, asdict, field
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 
+# 知识库模块
+try:
+    from context_patch.knowledge import KnowledgeBase
+    KNOWLEDGE_AVAILABLE = True
+except ImportError:
+    KNOWLEDGE_AVAILABLE = False
+
 
 @dataclass
 class Dependency:
@@ -50,6 +57,10 @@ class AgentRequest:
     scan_depth: int = 2
     include_locked: bool = True
     format: str = "markdown"  # markdown, json, compact
+    # 知识库相关参数
+    enable_knowledge: bool = True  # 是否启用知识库
+    knowledge_max_results: int = 3  # 知识库返回结果数
+    knowledge_config_path: Optional[str] = None  # 知识库配置路径
 
 
 @dataclass
@@ -59,6 +70,8 @@ class AgentResponse:
     context_patch: str = ""
     version_map: Dict[str, Any] = field(default_factory=dict)
     projects_found: List[str] = field(default_factory=list)
+    knowledge_context: str = ""  # 知识库上下文
+    knowledge_results: List[Dict[str, Any]] = field(default_factory=list)  # 知识库检索结果
     error: Optional[str] = None
 
 
@@ -112,14 +125,17 @@ class ContextPatchAgent:
         
         Args:
             project_root: 项目根目录路径
-            **kwargs: 其他参数 (scan_depth, include_locked, format)
+            **kwargs: 其他参数 (scan_depth, include_locked, format, enable_knowledge, knowledge_max_results, knowledge_config_path)
             
         Returns:
             AgentResponse: 包含上下文补丁的响应
         """
         request = AgentRequest(
             project_root=project_root,
-            **{k: v for k, v in kwargs.items() if k in ['scan_depth', 'include_locked', 'format']}
+            **{k: v for k, v in kwargs.items() if k in [
+                'scan_depth', 'include_locked', 'format', 
+                'enable_knowledge', 'knowledge_max_results', 'knowledge_config_path'
+            ]}
         )
         
         try:
@@ -159,11 +175,29 @@ class ContextPatchAgent:
             # 3. 生成上下文
             context_patch = self._generate_context(projects, request.format, request.include_locked)
             
+            # 4. 知识库检索（可选）
+            knowledge_context = ""
+            knowledge_results = []
+            if request.enable_knowledge and KNOWLEDGE_AVAILABLE:
+                try:
+                    knowledge_context, knowledge_results = self._retrieve_knowledge(
+                        projects, 
+                        request.knowledge_max_results,
+                        request.knowledge_config_path
+                    )
+                    # 将知识库上下文附加到版本上下文后面
+                    if knowledge_context:
+                        context_patch += knowledge_context
+                except Exception as e:
+                    print(f"Warning: Knowledge base retrieval failed: {e}")
+            
             return AgentResponse(
                 success=True,
                 context_patch=context_patch,
                 version_map=version_map,
-                projects_found=[p.name for p in projects]
+                projects_found=[p.name for p in projects],
+                knowledge_context=knowledge_context,
+                knowledge_results=knowledge_results
             )
             
         except Exception as e:
@@ -436,6 +470,46 @@ class ContextPatchAgent:
         else:
             return self._generate_markdown_context(projects, include_locked)
     
+    def _retrieve_knowledge(self, projects: List[Project], max_results: int, config_path: Optional[str] = None) -> tuple[str, List[Dict[str, Any]]]:
+        """从知识库检索相关内容"""
+        if not projects:
+            return "", []
+        
+        # 使用第一个项目的信息进行检索
+        project = projects[0]
+        
+        # 构建依赖字典
+        dependencies = {}
+        for dep in project.dependencies:
+            if dep.type in ['production', 'runtime']:
+                dependencies[dep.name] = dep.version
+        
+        # 初始化知识库
+        kb = KnowledgeBase(config_path)
+        kb.initialize()
+        
+        # 检索
+        response = kb.retrieve(
+            language=project.language,
+            framework=project.framework,
+            dependencies=dependencies,
+            max_results=max_results
+        )
+        
+        # 整理结果
+        results = []
+        for result in response.results:
+            results.append({
+                'title': result.item.title,
+                'source': result.item.source,
+                'source_type': result.item.source_type,
+                'relevance': result.relevance,
+                'match_reasons': result.match_reasons,
+                'path': result.item.path
+            })
+        
+        return response.knowledge_context, results
+    
     def _generate_markdown_context(self, projects: List[Project], include_locked: bool) -> str:
         """生成 Markdown 格式上下文"""
         lines = []
@@ -644,12 +718,20 @@ Effective Context = (Current Env Versions) + (API Contracts) + (Domain-Specific 
         parser.add_argument('--no-locked', action='store_true', help='Exclude locked versions')
         parser.add_argument('--output', '-o', help='Output file')
         
+        # 知识库相关参数
+        parser.add_argument('--no-knowledge', action='store_true', help='Disable knowledge base')
+        parser.add_argument('--knowledge-config', help='Knowledge base config path')
+        parser.add_argument('--knowledge-limit', type=int, default=3, help='Max knowledge results')
+        
         parsed_args = parser.parse_args(args)
         
         response = self.execute(
             project_root=parsed_args.project_root,
             format=parsed_args.format,
-            include_locked=not parsed_args.no_locked
+            include_locked=not parsed_args.no_locked,
+            enable_knowledge=not parsed_args.no_knowledge,
+            knowledge_config_path=parsed_args.knowledge_config,
+            knowledge_max_results=parsed_args.knowledge_limit
         )
         
         if response.success:
